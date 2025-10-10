@@ -1,0 +1,681 @@
+"""
+library.py
+signal-processing and clustering utilities for a 24 h nesting-box
+recording.  Designed for memory-constrained laptops and guided by best practice
+in bio-acoustics: band-pass 2-8 kHz, RMS activity detection, power-domain
+averaging, log-dB scaling, and Parseval-consistent operations.
+
+Author: Pigbythesea
+Created: 2025-08-05
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, List, Tuple
+import numpy as np
+import soundfile as sf
+from scipy.signal import butter, sosfiltfilt, stft, find_peaks
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans, SpectralClustering, DBSCAN, AgglomerativeClustering
+from sklearn.metrics import pairwise_distances
+from tqdm import tqdm
+from collections import Counter
+from scipy.cluster.hierarchy import linkage, fcluster
+from sklearn.neighbors import NearestNeighbors
+from typing import Optional
+import matplotlib.pyplot as plt
+
+# -----------------------------------------------------------------------------#
+# Configuration dataclass
+# -----------------------------------------------------------------------------#
+
+@dataclass
+class Config:
+    """All tunables live here so `execution.py` can override as needed."""
+    sample_rate: int = 48_000                    # Hz
+    bandpass_hz: Tuple[int, int] = (1_000, 12_000)
+    chunk_sec: int = 7200                        # 2h of audio per segment
+    rms_win_ms: int = 25                         # RMS frame length
+    rms_hop_ms: int = 10                         # RMS hop
+    sigma_mult: float = 3.0                      # baseline + sigma multiplier for peak
+    min_seg_ms: int = 50                         # discard shorter segments
+    merge_gap_ms: int = 30                       # merge close bursts
+    stft_win: int = 1024
+    stft_hop: int = 512
+    pca_variance: float = 0.95                   # keep 95 % variance
+    random_state: int = 42
+    dbscan_eps: float = 1.0
+    dbscan_min_samples: int = 5
+    first_k: int = 30     # two-step stage-1
+    final_k: int = 6      # two-step stage-2
+    hier_n_clusters: int | None = None      # Ward single-stage
+    hier_two_big: int = 0.35             # coarse cut
+    hier_two_small: int = 0.12            # per-big-cluster k-means
+    dbscan_grid      : tuple = (0.6, 0.8, 1.0, 1.2, 1.4)  # candidate eps
+    hier_grid        : tuple = tuple(range(50, 401, 25))  # candidate distance thresholds
+    hier_penalty     : float = 1e-1                       # as in reference.py
+    # --- spectrogram parameters (shared everywhere) --------------------------
+    n_fft: int  = 1024         # window length in samples
+    hop_fft: int = 512         # step size  (= 50 % overlap)
+    ref_db_floor: float = 1e-12  # floor to avoid -inf in log10
+
+
+
+
+# -----------------------------------------------------------------------------#
+# I/O – memory-safe chunk iterator
+# -----------------------------------------------------------------------------#
+
+def iter_audio_chunks(path: Path,
+                      cfg: Config) -> Iterable[Tuple[np.ndarray, int]]:
+    """
+    Stream `cfg.chunk_sec` seconds of audio at a time.
+    Yields (mono_float32, chunk_start_sample).
+    """
+    sr = cfg.sample_rate
+    frames_per_chunk = cfg.chunk_sec * sr
+
+    with sf.SoundFile(path) as snd:
+        total_chunks = int(np.ceil(snd.frames / frames_per_chunk))
+        pbar = tqdm(total=total_chunks, desc="Streaming audio", unit="chunk")
+        if snd.samplerate != sr:
+            raise ValueError(f"Expected {sr} Hz but file is {snd.samplerate} Hz")
+        idx = 0
+        while True:
+            data = snd.read(frames_per_chunk, dtype='float32', always_2d=True)
+            if data.size == 0:
+                break
+            # Mono—average channels
+            y = data.mean(axis=1)
+            yield y, idx
+            idx += len(y)
+            pbar.update(1)
+        pbar.close()
+
+
+# -----------------------------------------------------------------------------#
+# Filtering
+# -----------------------------------------------------------------------------#
+
+def bandpass(y: np.ndarray, sr: int,
+             low: float, high: float,
+             order: int = 4) -> np.ndarray:
+    """Zero-phase Butterworth band-pass."""
+    sos = butter(order, [low, high], btype='bandpass',
+                 fs=sr, output='sos')
+    return sosfiltfilt(sos, y)
+
+
+# -----------------------------------------------------------------------------#
+# RMS envelope and segmentation
+# -----------------------------------------------------------------------------#
+
+def rms_envelope(y: np.ndarray, sr: int, win_samp: int, hop_samp: int) -> np.ndarray:
+    """Vectorised RMS over sliding window."""
+    # Pad to multiple of hop for convenience
+    pad = (-len(y)) % hop_samp
+    if pad:
+        y = np.pad(y, (0, pad), mode='constant')
+    y_frames = y.reshape(-1, hop_samp)
+    # Compute frame energies via stride trick
+    frame_energy = np.square(y_frames).mean(axis=1)
+    win = np.ones(win_samp // hop_samp)
+    rms = np.sqrt(np.convolve(frame_energy, win, 'same'))
+    return rms
+
+
+def detect_segments(y: np.ndarray,
+                    sr: int,
+                    cfg: Config,
+                    chunk_offset: int = 0) -> List[Tuple[int, int]]:
+    """
+    Return list of (start_sample, end_sample) pairs **in global sample units**
+    for vocal-activity segments detected within `y`.
+    """
+    # bandpass the audio before detecting segments
+    y = bandpass(y, sr, *cfg.bandpass_hz)
+    # Parameters in samples
+    hop = int(cfg.rms_hop_ms * 1e-3 * sr)
+    win = int(cfg.rms_win_ms * 1e-3 * sr)
+    env = rms_envelope(y, sr, win, hop)
+    
+    # convert RMS-amplitude: linear power
+    power_env = np.square(env)  # linear power
+    peaks, _ = find_peaks(power_env,
+                      height=np.percentile(power_env, 80),
+                      distance=int(cfg.min_seg_ms / cfg.rms_hop_ms))
+
+    baseline_pool = []
+    for a, b in zip(peaks[:-1], peaks[1:]):
+        slice_ = power_env[a:b]
+        baseline_pool.extend(slice_[slice_ < np.median(slice_)])
+
+    if not baseline_pool:                      # fallback if no gaps found
+        baseline_pool = power_env
+
+    mu  = float(np.mean(baseline_pool))
+    sig = float(np.std(baseline_pool, ddof=0))
+    thresh_power = mu + 3.0 * sig              # reference: μ+3σ
+
+    active = power_env > thresh_power
+    
+
+    # Frame indices → sample indices
+    segs = []
+    in_seg = False
+    seg_start_frame = 0
+    for i, a in enumerate(tqdm(active, desc="Detect segments", leave=False, unit="frame")):
+        if a and not in_seg:
+            in_seg = True
+            seg_start_frame = i
+        elif not a and in_seg:
+            in_seg = False
+            segs.append((seg_start_frame, i))
+
+    # Post processing (merge & min length)
+    merged: List[Tuple[int, int]] = []
+    gap_frames = int(cfg.merge_gap_ms / cfg.rms_hop_ms)
+    min_frames = int(cfg.min_seg_ms / cfg.rms_hop_ms)
+
+    for s, e in segs:
+        if (e - s) < min_frames:
+            continue
+        if not merged:
+            merged.append([s, e])
+        else:
+            prev_s, prev_e = merged[-1]
+            if s - prev_e <= gap_frames:
+                merged[-1][1] = e
+            else:
+                merged.append([s, e])
+
+    # Convert to sample offsets (global)
+    seg_sample: List[Tuple[int, int]] = []
+    for s_f, e_f in merged:
+        start = chunk_offset + s_f * hop
+        end = chunk_offset + e_f * hop
+        seg_sample.append((start, end))
+
+    return seg_sample
+
+
+# -----------------------------------------------------------------------------#
+# Spectrogram & feature extraction
+# -----------------------------------------------------------------------------#
+
+def segment_mag_linear(y_seg: np.ndarray, sr: int, cfg: Config) -> np.ndarray:
+    """
+    Produce a *frequency-power* vector (time-averaged dB spectrum) for a segment.
+    Dimensionality = n_freq_bins determined by STFT parameters.
+    """
+    f, t, Z = stft(
+        y_seg,
+        fs=sr,
+        nperseg=cfg.stft_win,
+        noverlap=cfg.stft_win - cfg.stft_hop,
+        window="hann",
+        padded=False,
+        boundary=None,
+    )
+    power = np.abs(Z)**2  # linear power
+    mag = np.abs(Z).astype(np.float32)
+    avg_mag = mag.mean(axis=1)
+    return avg_mag
+
+def segment_spectro_db(y_seg: np.ndarray, sr: int, cfg) -> np.ndarray:
+    """
+    Return a 1-D feature vector: mean log-power spectrum of one segment.
+    Length = n_fft//2 + 1.
+    """
+    _, _, Z = stft(
+        y_seg,
+        fs=sr,
+        nperseg=cfg.n_fft,
+        noverlap=cfg.n_fft - cfg.hop_fft,
+        window="hann",
+        padded=False,
+        boundary=None,
+    )
+    power   = np.square(np.abs(Z), dtype=np.float32)          # linear power
+    avg_pow = power.mean(axis=1)                              # **pool in linear domain**
+    feat_db = 10.0 * np.log10(avg_pow + cfg.ref_db_floor)     # convert after pooling
+    return feat_db.astype(np.float32)
+
+def extract_broad_features_segment(y_seg: np.ndarray, sr: int, cfg) -> np.ndarray:
+    """
+    Return [duration_s, total_energy, spectral_centroid_Hz, bandwidth_Hz].
+
+    • duration   – seconds (linear domain)
+    • energy     – ∑(y²)  (linear power, Parseval-consistent)
+    • centroid   – Σ f·P(f) / Σ P(f)  (Hz, linear power weight)
+    • bandwidth  – √(Σ (f-centroid)² · P(f) / Σ P(f))  (Hz)
+    """
+    dur = len(y_seg) / sr
+
+    # FFT once for centroid + bandwidth
+    freqs, _, Z = stft(
+        y_seg,
+        fs=sr,
+        nperseg=cfg.n_fft,
+        noverlap=cfg.n_fft - cfg.hop_fft,
+        window="hann",
+        padded=False,
+        boundary=None,
+    )
+    P = np.square(np.abs(Z), dtype=np.float32)     # linear power
+    P_mean = P.mean(axis=1)                        # average over time
+
+    energy = float(P_mean.sum())
+    if energy == 0:                                # silence guard
+        return np.array([dur, 0.0, 0.0, 0.0], dtype=np.float32)
+
+    centroid = float(np.sum(freqs * P_mean) / energy)
+    bandwidth = float(np.sqrt(np.sum(((freqs - centroid) ** 2) * P_mean) / energy))
+    return np.array([dur, energy, centroid, bandwidth], dtype=np.float32)
+
+def two_step_ward(
+    broad_mat: np.ndarray,
+    X_pca: np.ndarray,
+    dist_big: float,
+    dist_small: float,
+) -> np.ndarray:
+    """
+    Two-stage Ward that mirrors reference.py:
+    1) coarse cut on *broad features*
+    2) refine each coarse group on *PCA scores*
+
+    Returns 1-D label array (length = n_segments).
+    """
+    coarse = ward_by_distance(broad_mat, dist_big)     # step-1
+
+    final = np.zeros_like(coarse)
+    next_lbl = 0
+    for cid in np.unique(coarse):
+        idx = np.where(coarse == cid)[0]               # indices of this macro cluster
+        sub_labels = ward_by_distance(X_pca[idx], dist_small)
+        final[idx] = sub_labels + next_lbl
+        next_lbl += sub_labels.max() + 1               # ensure global uniqueness
+    return final.astype(int)
+
+
+# -----------------------------------------------------------------------------#
+# Dimensionality reduction
+# -----------------------------------------------------------------------------#
+
+def reduce_dim(X: np.ndarray,
+               cfg: Config) -> Tuple[np.ndarray, PCA]:
+    """PCA to desired retained variance."""
+    pca = PCA(n_components=38,
+              random_state=cfg.random_state,
+              svd_solver='full')
+    Xr = pca.fit_transform(X)
+    return Xr, pca
+
+
+# -----------------------------------------------------------------------------#
+# Clustering wrappers
+# -----------------------------------------------------------------------------#
+
+def cluster_kmeans(X: np.ndarray,
+                   k: int,
+                   cfg: Config) -> np.ndarray:
+    model = KMeans(n_clusters=k,
+                   n_init="auto",
+                   random_state=cfg.random_state)
+    return model.fit_predict(X)
+
+
+def cluster_spectral(X: np.ndarray,
+                     k: int,
+                     n_neighbors: int,
+                     cfg: Config) -> np.ndarray:
+    model = SpectralClustering(
+        n_clusters=k,
+        affinity='nearest_neighbors',
+        n_neighbors=n_neighbors,
+        assign_labels='kmeans',
+        random_state=cfg.random_state,
+    )
+    return model.fit_predict(X)
+
+def cluster_dbscan(X_red: np.ndarray,
+                   cfg,
+                   eps: float | None = None,
+                   min_samples: int | None = None):
+    """
+    Density-based clustering (DBSCAN) that matches the data contract of
+    cluster_kmeans() / cluster_spectral().
+
+    Parameters
+    ----------
+    X_red : ndarray            # already reduced feature space
+    cfg   : Namespace / dict   # same cfg object you pass elsewhere
+    eps, min_samples :         # override cfg defaults if supplied
+    Returns
+    -------
+    labels : ndarray, shape (n_segments,)
+    model  : fitted DBSCAN instance
+    """
+    eps_ = eps or getattr(cfg, "dbscan_eps", 0.5)
+    ms_  = min_samples or getattr(cfg, "dbscan_min_samples", 5)
+
+    model = DBSCAN(eps=eps_, min_samples=ms_, metric="cosine", n_jobs=-1)
+    labels = model.fit_predict(X_red)
+
+    # keep the return tuple identical to k-means
+    return labels
+
+def estimate_eps(X, k=5):
+    d, _ = NearestNeighbors(n_neighbors=k).fit(X).kneighbors(X)
+    kth = np.sort(d[:, -1])          # distance to k-th neighbour
+    return np.percentile(kth, 75)    # robust elbow
+
+
+def tune_dbscan(X, cfg):
+    eps0 = estimate_eps(X, cfg.dbscan_min_samples)
+    grid = eps0 * np.array([0.8, 1.0, 1.2, 1.4])
+    best_eps, best_labels, best_k = None, None, -1
+    for eps in grid:
+        labels = cluster_dbscan(X, cfg, eps=eps)
+        k = len(set(labels)) - (1 if -1 in labels else 0)
+        if k > best_k:
+            best_eps, best_k, best_labels = eps, k, labels
+    print(f"[DBSCAN] eps*={best_eps:.2f} → {best_k} clusters (+noise)")
+    return best_eps, best_labels
+
+
+def cluster_hierarchical_ward(X_red: np.ndarray,
+                              cfg,
+                              n_clusters: int | None = None):
+    """
+    Ward-linkage agglomerative clustering. Mirrors the k-means interface.
+    """
+    k_ = n_clusters or getattr(cfg, "hier_n_clusters", 5)
+
+    model = AgglomerativeClustering(
+        n_clusters=k_,
+        metric="euclidean",
+        linkage="ward")
+    labels = model.fit_predict(X_red)
+
+    return labels
+
+def cluster_two_step_hierarchical(X_red: np.ndarray,
+                                  cfg,
+                                  first_k: int | None = None,
+                                  final_k: int | None = None):
+    """
+    Two-stage Ward: (1) over-cluster, (2) cluster the cluster centroids.
+    """
+    first_k  = first_k  or getattr(cfg, "first_k", 20)
+    final_k  = final_k  or getattr(cfg, "final_k", 5)
+
+    # ---------- Stage 1 ----------
+    stage1 = AgglomerativeClustering(
+        n_clusters=first_k, linkage="ward", metric="euclidean"
+    ).fit_predict(X_red)
+
+    # Compute centroids of those micro-clusters
+    centroids = np.vstack([
+        X_red[stage1 == cid].mean(axis=0) for cid in range(first_k)
+    ])
+
+    # ---------- Stage 2 ----------
+    stage2_model = AgglomerativeClustering(
+        n_clusters=final_k, linkage="ward", metric="euclidean"
+    )
+    stage2_labels = stage2_model.fit_predict(centroids)
+
+    # broadcast centroid labels back to individual segments
+    labels = np.array([stage2_labels[cid] for cid in stage1])
+
+    return labels
+
+def ward_by_distance(X_red: np.ndarray, dist: float) -> np.ndarray:
+    """SciPy linkage + fcluster → labels at a given cut-height."""
+    Z = linkage(X_red, method="ward", metric="euclidean")
+    labels = fcluster(Z, t=dist, criterion="distance") - 1  # 0-based
+    return labels
+
+def total_variance(X, labels):
+    var = 0.0
+    for lab in set(labels):
+        var += np.var(X[labels == lab])
+    return var
+
+def tune_ward_distance(X_red, cfg):
+    best_cost, best_labels, best_d = np.inf, None, None
+    for d in cfg.hier_grid:
+        labels = ward_by_distance(X_red, d)
+        k = len(set(labels))
+        cost = total_variance(X_red, labels) + cfg.hier_penalty * k
+        if cost < best_cost:
+            best_cost, best_labels, best_d = cost, labels, d
+    print(f"[Ward] dist*={best_d} → {k} clusters, cost={best_cost:.2f}")
+    return best_d, best_labels
+
+def tune_two_step(X_red, cfg):
+    best_cost, best_labels = np.inf, None
+    for broad in cfg.hier_grid:
+        coarse = ward_by_distance(X_red, broad)              # 1️⃣ coarse cut
+        cents  = np.vstack([X_red[coarse == c].mean(axis=0)  # centroids
+                            for c in sorted(set(coarse))])
+        for refine in (broad/4, broad/3, broad/2):           # 2️⃣ refine grid
+            fine = ward_by_distance(cents, refine)
+            labels = np.array([fine[c] for c in coarse])
+            cost = total_variance(X_red, labels) + cfg.hier_penalty * len(set(labels))
+            if cost < best_cost:
+                best_cost, best_labels = cost, labels
+    print(f"[2-step Ward] cost={best_cost:.2f} → {len(set(best_labels))} clusters")
+    return best_labels
+
+
+
+
+# -----------------------------------------------------------------------------#
+# Export helpers
+# -----------------------------------------------------------------------------#
+
+
+
+def write_manifest(segs: List[Tuple[int, int]],
+                   labels: np.ndarray,
+                   path: Path):
+    """
+    CSV with start_sample, end_sample, label.
+    """
+    header = "start_sample,end_sample,label\n"
+    rows = [f"{s},{e},{lab}\n" for (s, e), lab in zip(segs, labels)]
+    path.write_text(header + "".join(rows), encoding='utf-8')
+    
+
+def save_cluster_snippets(audio_path: Path,
+                          sr: int,
+                          segs: List[Tuple[int, int]],
+                          labels: np.ndarray,
+                          out_dir: Path,
+                          concat: bool = True):
+    """
+    Write individual WAVs (cluster_<id>/<start>_<end>.wav).  If `concat=True`,
+    also stream all snippets of a cluster into cluster_<id>.wav.
+    Guaranteed to emit **mono** data regardless of the source file’s channel
+    count, so the concat handle is always opened with channels=1.
+    """
+    concat_handles: dict[int, sf.SoundFile] = {}
+
+    with sf.SoundFile(audio_path) as snd, \
+         tqdm(total=len(segs), desc=f"Snippets → {out_dir.name}", unit="wav") as bar:
+
+        for (start, end), lab in zip(segs, labels):
+            snd.seek(start)
+            # read strictly as 2-D (frames, channels)
+            clip = snd.read(end - start, dtype='float32', always_2d=True)
+            # fold to mono and ensure C-contiguous 1-D shape
+            clip = np.asarray(clip.mean(axis=1), order='C')
+
+            # ---------- disk I/O ----------
+            if concat:
+                wav_path = out_dir / (f"cluster_{lab:03d}.wav" if lab >= 0 else "cluster_noise.wav")
+                if lab not in concat_handles:
+                    concat_handles[lab] = sf.SoundFile(
+                        wav_path, mode='w',
+                        samplerate=sr, channels=1, subtype='PCM_16')
+                concat_handles[lab].write(clip)
+
+            bar.update(1)
+
+    for h in concat_handles.values():
+        h.close()
+
+# -----------------------------------------------------------------------------
+# Visualization helpers: overview & per-call spectrograms
+# -----------------------------------------------------------------------------
+
+def plot_db_spectrogram(
+    y: np.ndarray,
+    sr: int,
+    cfg,
+    title: str = "",
+    vmax: Optional[float] = None,
+    vmin: Optional[float] = None,
+    show: bool = True,
+    save_path: Optional[Path] = None,
+):
+    """
+    Band-pass (cfg.bandpass_hz) -> STFT -> log-dB spectrogram.
+    Uses cfg.n_fft / cfg.hop_fft.
+    """
+    y_f = bandpass(y, sr, *cfg.bandpass_hz)
+    f, t, Z = stft(
+        y_f,
+        fs=sr,
+        nperseg=cfg.n_fft,
+        noverlap=cfg.n_fft - cfg.hop_fft,
+        window="hann",
+        padded=False,
+        boundary=None,
+    )
+    S = 10.0 * np.log10((np.abs(Z) ** 2) + cfg.ref_db_floor)
+
+    if vmax is None:
+        vmax = np.percentile(S, 99.0)
+    if vmin is None:
+        vmin = vmax - 80.0  # ~80 dB range looks good for bird calls
+
+    plt.figure(figsize=(10, 4))
+    plt.pcolormesh(t, f / 1000.0, S, shading="auto", vmin=vmin, vmax=vmax)
+    plt.ylim(cfg.bandpass_hz[0] / 1000.0, cfg.bandpass_hz[1] / 1000.0)
+    plt.xlabel("Time (s)")
+    plt.ylabel("Frequency (kHz)")
+    plt.title(title)
+    cbar = plt.colorbar()
+    cbar.set_label("Power (dB)")
+    plt.tight_layout()
+
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=150)
+    if show:
+        plt.show()
+    plt.close()
+
+
+def save_overview_spectrogram(
+    audio_path: Path,
+    sr: int,
+    segs: List[Tuple[int, int]],
+    cfg,
+    out_dir: Path,
+    preview_sec: int = 15,
+) -> Tuple[Path, Path]:
+    """
+    Save (1) a band-passed log-dB spectrogram over a short window and
+    (2) the matching waveform with vertical lines at detected segment bounds.
+    Returns (spectrogram_png, waveform_png).
+    """
+    assert len(segs) > 0, "No segments to preview."
+
+    first_start = segs[0][0]
+    win_start = max(0, first_start - (preview_sec // 2) * sr)
+    win_end = win_start + preview_sec * sr
+
+    with sf.SoundFile(audio_path) as snd:
+        snd.seek(win_start)
+        y_win = snd.read(win_end - win_start, dtype="float32", always_2d=True).mean(axis=1)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    spec_path = out_dir / "overview.png"
+    plot_db_spectrogram(
+        y_win,
+        sr,
+        cfg,
+        title=f"Overview spectrogram (t ≈ {win_start/sr:.1f}–{win_end/sr:.1f}s)",
+        show=False,
+        save_path=spec_path,
+    )
+
+    wave_path = out_dir / "overview_wave_with_segments.png"
+    t_axis = np.arange(len(y_win)) / sr
+    plt.figure(figsize=(10, 1.4))
+    plt.plot(t_axis, y_win, linewidth=0.5)
+    for (s, e) in segs:
+        if s >= win_start and e <= win_end:
+            t0 = (s - win_start) / sr
+            t1 = (e - win_start) / sr
+            plt.axvline(t0, linestyle="--", linewidth=0.8)
+            plt.axvline(t1, linestyle="--", linewidth=0.8)
+    plt.xlabel("Time (s)   (same window as the spectrogram)")
+    plt.yticks([])
+    plt.tight_layout()
+    plt.savefig(wave_path, dpi=150)
+    plt.close()
+
+    return spec_path, wave_path
+
+
+def save_call_spectrograms(
+    audio_path: Path,
+    sr: int,
+    segs: List[Tuple[int, int]],
+    cfg,
+    out_dir: Path,
+    labels: Optional[np.ndarray] = None,
+    n_preview: int = 20,
+    mode: str = "random",  # "random" or "longest"
+) -> List[Path]:
+    """
+    Save band-passed log-dB spectrogram PNGs for a subset of detected calls.
+    If `labels` provided, include them in the filename & title.
+    """
+    if len(segs) == 0:
+        return []
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    seg_lengths = np.array([e - s for (s, e) in segs])
+
+    if mode == "longest":
+        idx = np.argsort(seg_lengths)[-min(n_preview, len(segs)) :]
+    else:
+        rng = np.random.default_rng(getattr(cfg, "random_state", None))
+        n_take = min(n_preview, len(segs))
+        idx = rng.choice(len(segs), size=n_take, replace=False)
+        idx.sort()
+
+    saved: List[Path] = []
+    with sf.SoundFile(audio_path) as snd:
+        for i in idx:
+            s, e = segs[i]
+            snd.seek(s)
+            y_seg = snd.read(e - s, dtype="float32", always_2d=True).mean(axis=1)
+
+            lab_txt = ""
+            if labels is not None:
+                lab_txt = f"_km{int(labels[i])}"
+            title = f"Call #{i}  ({(e - s) / sr * 1000:.0f} ms){' | k-means: ' + str(int(labels[i])) if labels is not None else ''}"
+
+            out_png = out_dir / f"call_{i:05d}{lab_txt}.png"
+            plot_db_spectrogram(y_seg, sr, cfg, title=title, show=False, save_path=out_png)
+            saved.append(out_png)
+
+    return saved

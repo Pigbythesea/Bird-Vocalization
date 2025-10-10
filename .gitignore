@@ -1,0 +1,20 @@
+# Big/raw stuff
+Data/
+artifacts/
+graphs/
+.venv/
+
+# Audio anywhere
+**/*.wav
+**/*.mp3
+**/*.flac
+**/*.aiff
+**/*.m4a
+**/*.ogg
+
+# Junk
+.DS_Store
+Thumbs.db
+.vscode/
+__pycache__/
+*.pyc
