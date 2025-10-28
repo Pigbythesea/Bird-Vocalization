@@ -12,10 +12,10 @@ Created: 2025-08-05
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Tuple, Optional
 import numpy as np
 import soundfile as sf
-from scipy.signal import butter, sosfiltfilt, stft, find_peaks
+from scipy.signal import butter, sosfiltfilt, stft, find_peaks, resample_poly
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans, SpectralClustering, DBSCAN, AgglomerativeClustering
 from sklearn.metrics import pairwise_distances
@@ -23,7 +23,7 @@ from tqdm import tqdm
 from collections import Counter
 from scipy.cluster.hierarchy import linkage, fcluster
 from sklearn.neighbors import NearestNeighbors
-from typing import Optional
+from typing import Optional, Dict, Any, Iterable, List, Tuple
 import matplotlib.pyplot as plt
 
 # -----------------------------------------------------------------------------#
@@ -67,18 +67,12 @@ class Config:
 # I/O – memory-safe chunk iterator
 # -----------------------------------------------------------------------------#
 
-def iter_audio_chunks(path: Path,
-                      cfg: Config) -> Iterable[Tuple[np.ndarray, int]]:
-    """
-    Stream `cfg.chunk_sec` seconds of audio at a time.
-    Yields (mono_float32, chunk_start_sample).
-    """
+def iter_audio_chunks(path: Path, cfg: Config, show_pbar: bool = True):
     sr = cfg.sample_rate
     frames_per_chunk = cfg.chunk_sec * sr
-
     with sf.SoundFile(path) as snd:
         total_chunks = int(np.ceil(snd.frames / frames_per_chunk))
-        pbar = tqdm(total=total_chunks, desc="Streaming audio", unit="chunk")
+        pbar = tqdm(total=total_chunks, desc="Streaming audio", unit="chunk") if show_pbar else None
         if snd.samplerate != sr:
             raise ValueError(f"Expected {sr} Hz but file is {snd.samplerate} Hz")
         idx = 0
@@ -86,13 +80,11 @@ def iter_audio_chunks(path: Path,
             data = snd.read(frames_per_chunk, dtype='float32', always_2d=True)
             if data.size == 0:
                 break
-            # Mono—average channels
-            y = data.mean(axis=1)
+            y = data.mean(axis=1)  # mono
             yield y, idx
             idx += len(y)
-            pbar.update(1)
-        pbar.close()
-
+            if pbar: pbar.update(1)
+        if pbar: pbar.close()
 
 # -----------------------------------------------------------------------------#
 # Filtering
@@ -128,6 +120,7 @@ def rms_envelope(y: np.ndarray, sr: int, win_samp: int, hop_samp: int) -> np.nda
 def detect_segments(y: np.ndarray,
                     sr: int,
                     cfg: Config,
+                    progress: bool = False,
                     chunk_offset: int = 0) -> List[Tuple[int, int]]:
     """
     Return list of (start_sample, end_sample) pairs **in global sample units**
@@ -159,13 +152,13 @@ def detect_segments(y: np.ndarray,
     thresh_power = mu + 3.0 * sig              # reference: μ+3σ
 
     active = power_env > thresh_power
-    
+    iterable = tqdm(active, desc="Detect segments", leave=False, unit="frame") if progress else active
 
     # Frame indices → sample indices
     segs = []
     in_seg = False
     seg_start_frame = 0
-    for i, a in enumerate(tqdm(active, desc="Detect segments", leave=False, unit="frame")):
+    for i, a in enumerate(iterable):
         if a and not in_seg:
             in_seg = True
             seg_start_frame = i
@@ -300,13 +293,270 @@ def two_step_ward(
 
 
 # -----------------------------------------------------------------------------#
+# NEW: Per-segment spectrogram (fixed resolution), time-warp, and utilities
+# -----------------------------------------------------------------------------#
+
+def segment_spectrogram_power(
+    y_seg: np.ndarray,
+    sr: int,
+    n_fft: int,
+    hop_fft: int,
+    window: str = "hann",
+) -> np.ndarray:
+    """
+    Compute a per-segment STFT **linear power** spectrogram with fixed time–freq
+    resolution defined by (n_fft, hop_fft). No padding; boundary=None.
+
+    Parameters
+    ----------
+    y_seg : 1-D ndarray
+        Mono audio samples for a single detected segment.
+    sr : int
+        Sampling rate in Hz.
+    n_fft : int
+        STFT window length (samples).
+    hop_fft : int
+        STFT hop size (samples).
+    window : str
+        STFT window type (default: 'hann').
+
+    Returns
+    -------
+    S_pow : 2-D ndarray, shape (n_freq_bins, n_frames), dtype float32
+        Linear power spectrogram (|STFT|^2). Frequencies unchanged; frames vary
+        with segment duration.
+    """
+    # Compute STFT without padding
+    f, t, Z = stft(
+        y_seg,
+        fs=sr,
+        nperseg=n_fft,
+        noverlap=n_fft - hop_fft,
+        window=window,
+        padded=False,
+        boundary=None,
+    )
+    S_pow = (np.abs(Z) ** 2).astype(np.float32)
+    return S_pow
+
+
+def power_to_db(S_power: np.ndarray, ref_floor: float = 1e-12) -> np.ndarray:
+    """
+    Convert linear power to log10 dB with a small floor to avoid -inf.
+
+    Parameters
+    ----------
+    S_power : 2-D ndarray
+        Linear power spectrogram.
+    ref_floor : float
+        Additive floor before log10.
+
+    Returns
+    -------
+    S_db : 2-D ndarray, same shape as S_power, dtype float32
+        Log10 power in dB.
+    """
+    S_db = 10.0 * np.log10(S_power + float(ref_floor))
+    return S_db.astype(np.float32)
+
+
+def time_interpolate_spectrogram(
+    S: np.ndarray,
+    target_frames: int,
+) -> np.ndarray:
+    """
+    Warping: Interpolate a spectrogram **along the time axis only** to produce
+    exactly `target_frames` frames, leaving frequency bins unchanged.
+
+    Notes
+    -----
+    • Works on either linear-power or dB input; for most faithful energy
+      relationships, prefer interpolating **linear power**, then convert to dB.
+    • Uses 1-D linear interpolation per frequency bin.
+
+    Parameters
+    ----------
+    S : 2-D ndarray, shape (n_freq_bins, n_frames)
+        Input spectrogram (power or dB).
+    target_frames : int
+        Desired number of time frames.
+
+    Returns
+    -------
+    S_warp : 2-D ndarray, shape (n_freq_bins, target_frames)
+        Time-warped spectrogram in the same domain (power or dB) as input.
+    """
+    F, T = S.shape
+    if T == target_frames:
+        return S.copy()
+    if T <= 0:
+        return np.zeros((F, target_frames), dtype=S.dtype)
+    if target_frames <= 0:
+        raise ValueError("target_frames must be a positive integer")
+
+    x_old = np.linspace(0.0, 1.0, T, endpoint=True, dtype=np.float32)
+    x_new = np.linspace(0.0, 1.0, target_frames, endpoint=True, dtype=np.float32)
+
+    S_warp = np.empty((F, target_frames), dtype=S.dtype)
+    # Interpolate each frequency bin independently
+    for i in range(F):
+        S_warp[i] = np.interp(x_new, x_old, S[i])
+    return S_warp
+
+
+def duration_seconds(y_seg: np.ndarray, sr: int) -> float:
+    """
+    Duration of a segment in seconds.
+    """
+    return float(len(y_seg)) / float(sr)
+
+
+def flatten_spectrogram(S: np.ndarray, order: str = "C") -> np.ndarray:
+    """
+    Flatten a 2-D spectrogram to 1-D.
+    Parameters
+    ----------
+    S : 2-D ndarray
+        Spectrogram (power or dB).
+    order : {'C','F'}
+        Memory order for flattening (default 'C').
+
+    Returns
+    -------
+    v : 1-D ndarray, dtype float32
+    """
+    return np.asarray(S, dtype=np.float32).reshape(-1, order=order)
+
+
+def stack_patch_with_duration(patch_vec: np.ndarray, duration_s: float) -> np.ndarray:
+    """
+    Concatenate a flattened spectrogram patch with a scalar duration feature.
+    Returns a new 1-D float32 vector [patch_vec ; duration_s].
+    """
+    dur = np.array([float(duration_s)], dtype=np.float32)
+    return np.concatenate([patch_vec.astype(np.float32, copy=False), dur], axis=0)
+
+# -----------------------------------------------------------------------------#
+# Chunk-level STFT (POWER) and slicing
+# -----------------------------------------------------------------------------#
+
+def chunk_stft_power(y_chunk: np.ndarray,
+                     sr: int,
+                     n_fft: int,
+                     hop_fft: int,
+                     window: str = "hann") -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    STFT on an entire streamed chunk. Returns linear POWER spectrogram.
+
+    Returns
+    -------
+    f : ndarray [Hz]
+    t : ndarray [s]             (relative to chunk start)
+    S_pow : float32 [F x T]     (|STFT|^2)
+    """
+    f, t, Z = stft(
+        y_chunk,
+        fs=sr,
+        nperseg=n_fft,
+        noverlap=n_fft - hop_fft,
+        window=window,
+        padded=False,
+        boundary=None,
+    )
+    S_pow = (np.abs(Z) ** 2).astype(np.float32)
+    return f, t, S_pow
+
+
+def slice_segments_from_chunk_stft(S_pow: np.ndarray,
+                                   chunk_start_sample: int,
+                                   segs_for_chunk: list[tuple[int, int]],
+                                   hop_fft: int,
+                                   n_fft: int,
+                                   progress: bool = True,
+                                   desc: str | None = None) -> list[dict]:
+    """
+    Slice a CHUNK power spectrogram by (start,end) segment times (global samples).
+
+    Returns a list of dicts with:
+      {
+        "S_pow": [F x t_local],
+        "start_frame": int, "end_frame": int,
+        "start_sample": int, "end_sample": int,
+        "chunk_start_sample": int,
+      }
+    """
+    T = S_pow.shape[1]
+    out = []
+    if progress: 
+        iterable = tqdm(segs_for_chunk, desc=desc or "Slicing segments", leave=False, unit="segment")
+    
+    for (s_glob, e_glob) in iterable if progress else segs_for_chunk:
+        # sample indices relative to this chunk
+        s_rel = s_glob - chunk_start_sample
+        e_rel = e_glob - chunk_start_sample
+
+        # skip if fully outside
+        if e_rel <= 0 or s_rel >= (T * hop_fft + n_fft):
+            continue
+
+        # map samples -> STFT frame grid k*hop
+        s_frame = int(np.floor(max(0, s_rel) / hop_fft))
+        e_frame = int(np.ceil(max(0, e_rel) / hop_fft))
+
+        # clamp; ensure at least one column
+        s_frame = max(0, min(T - 1, s_frame))
+        e_frame = max(s_frame + 1, min(T, e_frame))
+
+        S_slice = S_pow[:, s_frame:e_frame].copy()
+        out.append({
+            "S_pow": S_slice,
+            "start_frame": s_frame,
+            "end_frame": e_frame,
+            "start_sample": s_glob,
+            "end_sample": e_glob,
+            "chunk_start_sample": chunk_start_sample,
+        })
+    return out
+
+
+def plot_frame_length_histogram(lengths_frames: np.ndarray,
+                                save_path: Optional[Path] = None,
+                                show: bool = True,
+                                title: str = "Distribution of call lengths (STFT frames)"):
+    if lengths_frames.size == 0:
+        print("No slices to plot.")
+        return None
+    n = lengths_frames.size
+    n_bins = int(np.clip(np.sqrt(n), 10, 60))
+    med = float(np.median(lengths_frames))
+    mean = float(np.mean(lengths_frames))
+
+    plt.figure(figsize=(7, 3.2))
+    plt.hist(lengths_frames, bins=n_bins, edgecolor="black", linewidth=0.5)
+    plt.axvline(med,  linestyle="--", linewidth=1.2, label=f"median = {med:.1f} frames")
+    plt.axvline(mean, linestyle=":",  linewidth=1.2, label=f"mean = {mean:.1f} frames")
+    plt.xlabel("Length (frames)")
+    plt.ylabel("Count")
+    plt.title(title + f"  (N={n})")
+    plt.legend(frameon=False, loc="upper right")
+    plt.tight_layout()
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=160)
+    if show:
+        plt.show()
+    return save_path
+
+
+
+# -----------------------------------------------------------------------------#
 # Dimensionality reduction
 # -----------------------------------------------------------------------------#
 
 def reduce_dim(X: np.ndarray,
                cfg: Config) -> Tuple[np.ndarray, PCA]:
     """PCA to desired retained variance."""
-    pca = PCA(n_components=38,
+    pca = PCA(n_components=cfg.pca_variance,
               random_state=cfg.random_state,
               svd_solver='full')
     Xr = pca.fit_transform(X)
@@ -679,3 +929,179 @@ def save_call_spectrograms(
             saved.append(out_png)
 
     return saved
+
+# -----------------------------------------------------------------------------#
+# Duration analytics & human-validation audio
+# -----------------------------------------------------------------------------#
+
+from typing import Optional, List, Tuple
+from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+import soundfile as sf
+from tqdm import tqdm
+
+def compute_segment_durations(
+    segs: List[Tuple[int, int]],
+    sr: int,
+    unit: str = "ms",
+) -> np.ndarray:
+    """
+    Return a 1-D array of segment durations given global sample-indexed segments.
+
+    Parameters
+    ----------
+    segs : list of (start_sample, end_sample)
+        Segment bounds in GLOBAL samples (as produced by `detect_segments`).
+    sr : int
+        Sampling rate (Hz).
+    unit : {'s','ms'}
+        Output unit for durations (seconds or milliseconds).
+
+    Returns
+    -------
+    durations : (N,) float ndarray
+        Durations in requested unit.
+    """
+    if len(segs) == 0:
+        return np.array([], dtype=np.float32)
+    dur_s = (np.array([e - s for (s, e) in segs], dtype=np.float64) / float(sr))
+    if unit == "s":
+        return dur_s.astype(np.float32)
+    elif unit == "ms":
+        return (dur_s * 1_000.0).astype(np.float32)
+    else:
+        raise ValueError("unit must be 's' or 'ms'")
+
+
+def plot_duration_histogram(
+    durations: np.ndarray,
+    bins: int | str = "auto",
+    unit: str = "ms",
+    log_x: bool = False,
+    show: bool = True,
+    save_path: Optional[Path] = None,
+    title: Optional[str] = None,
+) -> Optional[Path]:
+    """
+    Plot a histogram of call durations with median/mean markers.
+
+    Parameters
+    ----------
+    durations : (N,) ndarray
+        Durations in the desired unit (use `compute_segment_durations` first).
+    bins : int or 'auto'
+        Histogram binning.
+    unit : {'s','ms'}
+        Labeling only; does not convert values.
+    log_x : bool
+        If True, sets x-axis to log-scale (helpful for heavy tails).
+    show : bool
+        If True, display the plot.
+    save_path : Optional[Path]
+        If provided, saves the figure here (directories auto-created).
+    title : Optional[str]
+        Custom title; defaults to "Call duration distribution (N=...)".
+    """
+    N = len(durations)
+    if N == 0:
+        raise ValueError("No durations to plot.")
+
+    med = float(np.median(durations))
+    mean = float(np.mean(durations))
+
+    plt.figure(figsize=(8, 3))
+    plt.hist(durations, bins=bins, edgecolor="none")
+    plt.axvline(med, linestyle="--", linewidth=1.2, label=f"median = {med:.1f} {unit}")
+    plt.axvline(mean, linestyle=":", linewidth=1.2, label=f"mean = {mean:.1f} {unit}")
+    if log_x:
+        plt.xscale("log")
+    plt.xlabel(f"Duration ({unit})")
+    plt.ylabel("Count")
+    plt.title(title or f"Call duration distribution (N={N})")
+    plt.legend(frameon=False)
+    plt.tight_layout()
+
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=150)
+    if show:
+        plt.show()
+    plt.close()
+    return save_path
+
+
+def concat_calls_sorted_by_duration(
+    audio_path: Path,
+    sr: int,
+    segs: List[Tuple[int, int]],
+    out_wav: Path,
+    gap_ms: int = 100,
+    limit: Optional[int] = None,
+) -> Path:
+    """
+    Write a single mono WAV that concatenates ALL detected calls in ascending
+    duration order, inserting a fixed silence gap between calls.
+
+    This is intended for quick human validation of the segmenter.
+
+    Parameters
+    ----------
+    audio_path : Path
+        Path to the source audio (24 h file).
+    sr : int
+        Sampling rate in Hz. Must match the file's sample rate.
+    segs : list[(start_sample, end_sample)]
+        Segment bounds in GLOBAL sample units.
+    out_wav : Path
+        Destination WAV path. Will be created/overwritten.
+    gap_ms : int
+        Silence inserted between consecutive calls.
+    limit : Optional[int]
+        If set, only the shortest `limit` calls are included (for quick preview).
+
+    Returns
+    -------
+    out_wav : Path
+        The path to the written WAV file.
+    """
+    if len(segs) == 0:
+        raise ValueError("No segments provided.")
+
+    # Sort by duration ascending
+    durations = np.array([e - s for (s, e) in segs], dtype=np.int64)
+    order = np.argsort(durations, kind="stable")
+    if limit is not None:
+        order = order[: int(limit)]
+
+    gap_len = int(round(gap_ms * 1e-3 * sr))
+    gap = np.zeros(gap_len, dtype=np.float32) if gap_len > 0 else None
+
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+
+    # Stream read/write to keep memory bounded; fold to mono (match your pattern).
+    # (You already do this in save_cluster_snippets.) 【turn4file11†library.py†L38-L55】
+    with sf.SoundFile(audio_path) as snd, \
+         sf.SoundFile(out_wav, mode="w", samplerate=sr, channels=1, subtype="PCM_16") as out, \
+         tqdm(total=len(order), desc=f"Concat→{out_wav.name}", unit="call") as bar:
+
+        # Basic format sanity
+        if snd.samplerate != sr:
+            raise ValueError(f"Expected {sr} Hz but file has {snd.samplerate} Hz")
+
+        for idx in order:
+            s, e = segs[int(idx)]
+            if e <= s:
+                bar.update(1)
+                continue
+
+            snd.seek(s)
+            clip = snd.read(e - s, dtype="float32", always_2d=True).mean(axis=1)
+            out.write(np.asarray(clip, order="C"))
+
+            if gap is not None and len(gap) > 0:
+                out.write(gap)
+
+            bar.update(1)
+
+    return out_wav
