@@ -25,6 +25,7 @@ from scipy.cluster.hierarchy import linkage, fcluster
 from sklearn.neighbors import NearestNeighbors
 from typing import Optional, Dict, Any, Iterable, List, Tuple
 import matplotlib.pyplot as plt
+from scipy.interpolate import make_interp_spline, PchipInterpolator
 
 # -----------------------------------------------------------------------------#
 # Configuration dataclass
@@ -34,13 +35,13 @@ import matplotlib.pyplot as plt
 class Config:
     """All tunables live here so `execution.py` can override as needed."""
     sample_rate: int = 48_000                    # Hz
-    bandpass_hz: Tuple[int, int] = (1_000, 12_000)
+    bandpass_hz: Tuple[int, int] = (2_000, 8_000)
     chunk_sec: int = 7200                        # 2h of audio per segment
     rms_win_ms: int = 25                         # RMS frame length
-    rms_hop_ms: int = 10                         # RMS hop
+    rms_hop_ms: int = 5                         # RMS hop
     sigma_mult: float = 3.0                      # baseline + sigma multiplier for peak
-    min_seg_ms: int = 50                         # discard shorter segments
-    merge_gap_ms: int = 30                       # merge close bursts
+    min_seg_ms: int = 75                         # discard shorter segments
+    merge_gap_ms: int = 80                       # merge close bursts
     stft_win: int = 1024
     stft_hop: int = 512
     pca_variance: float = 0.95                   # keep 95 % variance
@@ -59,6 +60,11 @@ class Config:
     n_fft: int  = 1024         # window length in samples
     hop_fft: int = 512         # step size  (= 50 % overlap)
     ref_db_floor: float = 1e-12  # floor to avoid -inf in log10
+    sigma_mult_hi: float = 3.5   # start a segment
+    sigma_mult_lo: float = 2.5   # keep it going
+    hangover_ms:   int   = 30    # extend end by this much
+    preroll_ms:    int   = 30    # pull start a bit earlier
+
 
 
 
@@ -154,17 +160,36 @@ def detect_segments(y: np.ndarray,
     active = power_env > thresh_power
     iterable = tqdm(active, desc="Detect segments", leave=False, unit="frame") if progress else active
 
-    # Frame indices → sample indices
+    th_hi = mu + cfg.sigma_mult_hi * sig
+    th_lo = mu + cfg.sigma_mult_lo * sig
+
+    active_hi = power_env >= th_hi
+    active_lo = power_env >= th_lo
+
+    # Hysteresis scan in frame units
     segs = []
     in_seg = False
-    seg_start_frame = 0
-    for i, a in enumerate(iterable):
-        if a and not in_seg:
-            in_seg = True
-            seg_start_frame = i
-        elif not a and in_seg:
-            in_seg = False
-            segs.append((seg_start_frame, i))
+    start_f = None
+    hang_frames = int(cfg.hangover_ms / cfg.rms_hop_ms)
+    for i in range(len(power_env)):
+        if not in_seg:
+            if active_hi[i]:
+                in_seg = True
+                start_f = i
+                hang = 0
+        else:
+            if active_lo[i]:
+                hang = 0
+            else:
+                hang += 1
+                if hang >= hang_frames:
+                    end_f = i - hang_frames  # close a bit earlier than the dip
+                    segs.append((start_f, max(end_f, start_f + 1)))
+                    in_seg = False
+
+# close tail if still in segment
+    if in_seg:
+        segs.append((start_f, len(power_env)-1))
 
     # Post processing (merge & min length)
     merged: List[Tuple[int, int]] = []
@@ -182,15 +207,29 @@ def detect_segments(y: np.ndarray,
                 merged[-1][1] = e
             else:
                 merged.append([s, e])
+    
+    preroll = int(cfg.preroll_ms * 1e-3 * sr)
+    hang_s  = int(cfg.hangover_ms * 1e-3 * sr)
 
+    seg_sample = []
+    chunk_end = chunk_offset + len(y)
+    for s_f, e_f in merged:
+        start = max(chunk_offset, chunk_offset + s_f * hop - preroll)
+        end   = min(chunk_end,     chunk_offset + e_f * hop + hang_s)
+        if end > start:
+            seg_sample.append((start, end))
+    return seg_sample
+
+    '''
     # Convert to sample offsets (global)
     seg_sample: List[Tuple[int, int]] = []
     for s_f, e_f in merged:
         start = chunk_offset + s_f * hop
         end = chunk_offset + e_f * hop
         seg_sample.append((start, end))
-
+    
     return seg_sample
+    '''
 
 
 # -----------------------------------------------------------------------------#
@@ -402,6 +441,114 @@ def time_interpolate_spectrogram(
     for i in range(F):
         S_warp[i] = np.interp(x_new, x_old, S[i])
     return S_warp
+
+
+# power_to_db(S_power, ref_floor=1e-12) -> S_db
+def warp_spectrogram_db_spline(
+    S_power: np.ndarray,
+    target_frames: int,
+    *,
+    floor_db: float = -120.0,         # perceptual floor for display/robustness
+    use_pchip: bool = True,           # shape-preserving cubic by default
+    cubic_k: int = 3,                 # degree for B-spline if use_pchip=False
+    clip_db: tuple[float, float] | None = (-120.0, 80.0),
+) -> np.ndarray:
+    """
+    Warp along time in the **dB domain** using spline interpolation.
+
+    Parameters
+    ----------
+    S_power : (F, T) linear power spectrogram
+    target_frames : int
+    floor_db : float
+        Visual/log floor. Only used to clip after interpolation.
+    use_pchip : bool
+        If True, use shape-preserving cubic Hermite (recommended for dB).
+        If False, use a standard cubic B-spline via make_interp_spline.
+    cubic_k : int
+        Spline order (3=cubic) for B-spline path.
+    clip_db : (low, high) or None
+        Optional clipping of the output dynamic range (in dB).
+
+    Returns
+    -------
+    S_db_warp : (F, target_frames) dB spectrogram time-warped.
+    """
+    F, T = S_power.shape
+    if target_frames <= 0:
+        raise ValueError("target_frames must be positive")
+    if T == 0:
+        return np.full((F, target_frames), floor_db, dtype=np.float32)
+
+    # Convert to dB (same convention you already use)
+    # ref_floor in linear power that corresponds to floor_db
+    ref_floor_lin = 10.0 ** (floor_db / 10.0)  # e.g., -120 dB -> 1e-12
+    S_db = power_to_db(S_power, ref_floor=ref_floor_lin)  # (F, T), float32
+
+    # Too-short segments: cubic needs at least 4 points
+    if T < 4:
+        # fall back to your existing linear time interpolation (in dB)
+        return time_interpolate_spectrogram(S_db, target_frames)
+
+    # Normalized time grids
+    x_old = np.linspace(0.0, 1.0, T, endpoint=True, dtype=np.float64)
+    x_new = np.linspace(0.0, 1.0, target_frames, endpoint=True, dtype=np.float64)
+
+    # Vectorized interpolation across all frequency bins:
+    # Work with (T, F) so time is along axis=0 for the spline constructor.
+    Y = S_db.T  # shape (T, F)
+
+    if use_pchip:
+        # PCHIP doesn't support multi-axis vectorization in one call,
+        # so do a tight loop over columns (fast enough for ~512 bins).
+        out = np.empty((target_frames, F), dtype=np.float32)
+        for j in range(F):
+            f = PchipInterpolator(x_old, Y[:, j], extrapolate=False)
+            out[:, j] = f(x_new).astype(np.float32)
+        S_db_warp = out.T  # (F, target_frames)
+    else:
+        # B-spline (cubic) in one vectorized go
+        spline = make_interp_spline(x_old, Y, k=cubic_k, axis=0)  # (T,F), axis=0 is time
+        S_db_warp = spline(x_new).T.astype(np.float32)  # -> (F, target_frames)
+
+    if clip_db is not None:
+        lo, hi = clip_db
+        S_db_warp = np.clip(S_db_warp, lo, hi, out=S_db_warp)
+
+    return S_db_warp
+
+def truncate_spectrogram_db(
+    S_power: np.ndarray,
+    target_frames: int,
+    *,
+    floor_db: float = -120.0,
+) -> Optional[np.ndarray]:
+    """
+    Truncate along time: require at least `target_frames` columns, 
+    keep the first `target_frames`, and convert to dB.
+    Returns None if too short.
+
+    Parameters
+    ----------
+    S_power : (F, T) linear power spectrogram
+    target_frames : int
+    floor_db : float
+        dB floor used for power->dB conversion.
+
+    Returns
+    -------
+    S_db_trunc : (F, target_frames) float32 in dB, or None if T < target_frames.
+    """
+    F, T = S_power.shape
+    if target_frames <= 0:
+        raise ValueError("target_frames must be positive")
+    if T < target_frames:
+        return None
+
+    ref_floor_lin = 10.0 ** (floor_db / 10.0)  # e.g., -120 dB -> 1e-12
+    S_db = power_to_db(S_power, ref_floor=ref_floor_lin)  # existing util
+    S_db_trunc = S_db[:, :target_frames].astype(np.float32, copy=False)
+    return S_db_trunc
 
 
 def duration_seconds(y_seg: np.ndarray, sr: int) -> float:
@@ -1105,3 +1252,120 @@ def concat_calls_sorted_by_duration(
             bar.update(1)
 
     return out_wav
+
+def plot_cluster_spectra_from_patches(
+    feats: np.ndarray,
+    labels: np.ndarray,
+    cfg: Config,
+    target_frames: int,
+    out_dir: Path,
+    *,
+    include_duration: bool = True,
+    alpha_individual: float = 0.15,
+    lw_individual: float = 0.5,
+    lw_mean: float = 2.0,
+    show: bool = True,
+) -> List[Path]:
+    """
+    For each cluster id in `labels`, plot:
+
+      • all member spectra (one per segment) as semi-transparent lines
+      • the cluster-average spectrum as a solid line.
+
+    Assumes each feature vector in `feats` was built as:
+
+        flatten_spectrogram(S_db)      → length F * target_frames
+        stack_patch_with_duration(...) → optional +1 dim for duration
+
+    We:
+      1) optionally drop the last dimension (duration)
+      2) reshape to (F, target_frames)
+      3) average across time → (F,) dB spectrum per call
+      4) average those spectra across calls in the cluster.
+
+    Parameters
+    ----------
+    feats : (N, D) array
+        Per-segment feature vectors (flattened time-warped patches, with an
+        optional duration feature as the last dimension).
+    labels : (N,) array
+        Cluster labels for each segment.
+    cfg : Config
+        Must provide n_fft and sample_rate.
+    target_frames : int
+        The TARGET_FRAMES used when warping/truncating the spectrograms.
+    out_dir : Path
+        Directory to save one PNG per cluster.
+    include_duration : bool
+        If True, drop the last dimension as duration before reshaping.
+    alpha_individual : float
+        Transparency of individual spectra.
+    lw_individual : float
+        Line width of individual spectra.
+    lw_mean : float
+        Line width of the cluster-average spectrum.
+    show : bool
+        If True, display each plot in addition to saving it.
+
+    Returns
+    -------
+    saved_paths : list[Path]
+        One PNG path per cluster that had at least one member.
+    """
+    feats = np.asarray(feats)
+    labels = np.asarray(labels)
+    if feats.shape[0] != labels.shape[0]:
+        raise ValueError("feats and labels must have the same length.")
+
+    F = cfg.n_fft // 2 + 1
+    T = int(target_frames)
+    patch_dim = F * T
+
+    if include_duration:
+        if feats.shape[1] < patch_dim + 1:
+            raise ValueError(
+                f"Expected at least {patch_dim + 1} dims (patch + duration), "
+                f"got {feats.shape[1]}."
+            )
+        patches = feats[:, :patch_dim]
+    else:
+        if feats.shape[1] < patch_dim:
+            raise ValueError(
+                f"Expected at least {patch_dim} dims (patch), got {feats.shape[1]}."
+            )
+        patches = feats
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    freqs_khz = np.linspace(0.0, cfg.sample_rate / 2.0, F, endpoint=True) / 1000.0
+    saved_paths: List[Path] = []
+
+    for lab in sorted(set(labels)):
+        idx = np.where(labels == lab)[0]
+        if idx.size == 0:
+            continue
+
+        patch_lab = patches[idx].reshape(-1, F, T)  # (n_calls, F, T)
+        specs = patch_lab.mean(axis=2)              # (n_calls, F)
+        mean_spec = specs.mean(axis=0)              # (F,)
+
+        plt.figure(figsize=(6.5, 3.0))
+        for s in specs:
+            plt.plot(freqs_khz, s, alpha=alpha_individual,
+                     linewidth=lw_individual)
+        plt.plot(freqs_khz, mean_spec, linewidth=lw_mean)
+        plt.xlabel("Frequency (kHz)")
+        plt.ylabel("Level (dB)")
+        plt.title(f"Cluster {lab} — mean spectrum (N={idx.size})")
+        plt.tight_layout()
+
+        out_png = out_dir / f"cluster_{lab:03d}_spectrum.png"
+        plt.savefig(out_png, dpi=150)
+        saved_paths.append(out_png)
+
+        if show:
+            plt.show()
+        plt.close()
+
+    return saved_paths
